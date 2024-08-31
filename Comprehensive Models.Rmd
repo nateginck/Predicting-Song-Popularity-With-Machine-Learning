@@ -1,0 +1,529 @@
+---
+title: "FinalProject"
+author: "Nathaniel Ginck"
+date: "4/1/2024"
+output: word_document
+---
+
+# Read in Data, address categorical data, perform 5-Fold Cross Validation, and perform feature scaling
+```{r}
+# load packages
+library(caret)
+library(dplyr)
+
+# for reproducibility
+set.seed(0)
+
+# read training and testing sets
+train = read.csv('train.csv')
+test = read.csv('test.csv')
+
+# create new data frames for preparation
+train_norm <- train
+test_norm <- test
+
+# Remove Song with missing data (Hello Dolly)
+train_norm <- subset(train_norm, time_signature != 0)
+
+# define continuous features in dataset
+continuous <- c("duration_ms", "danceability", "energy", "loudness", "speechiness", "acousticness", "instrumentalness", "liveness", "valence", "tempo")
+
+# define categorical features in dataset
+categorical <- c("key", "time_signature", "track_genre")
+
+# convert categorical data to factors together, so that training and testing data stays aligned
+for(feature in categorical) {
+  # find all unique categorical features
+  all_levels <- unique(c(as.character(train_norm[[feature]]), as.character(test_norm[[feature]])))
+  
+  # Convert to characters
+  train_norm[[feature]] <- as.character(train_norm[[feature]])
+  test_norm[[feature]] <- as.character(test_norm[[feature]])
+  
+  # convert to factors
+  train_norm[[feature]] <- factor(train_norm[[feature]], levels = all_levels)
+  test_norm[[feature]]  <- factor(test_norm[[feature]], levels = all_levels)
+}
+
+# Function to create dummy variables for a dataset
+create_dummies <- function(dataset, categorical) {
+  
+  # create a matrix for dummy variables
+  dummy_vars <- lapply(categorical, function(var) {
+    model.matrix(~ get(var) - 1, data = dataset)[, -1]
+  })
+  
+  # add dummy variables to data set
+  names(dummy_vars) <- categorical
+  for (var in categorical) {
+    dummy_df <- as.data.frame(dummy_vars[[var]])
+    colnames(dummy_df) <- paste(var, colnames(dummy_df), sep = "_")
+    dataset <- cbind(dataset, dummy_df)
+  }
+
+  # Remove original categorical columns
+  dataset <- dataset[, !(names(dataset) %in% categorical)]
+  return(dataset)
+}
+
+
+# Call function to create dummy variables on training/testing data
+train_norm <- create_dummies(train_norm, categorical)
+test_norm <- create_dummies(test_norm, categorical)
+
+# Lastly, adjust boolean to integer (1 or 0)
+train_norm$explicit <- as.integer(train_norm$explicit)
+test_norm$explicit <- as.integer(test_norm$explicit)
+
+# tidy the feature names (remove parantheses)
+clean_column_names <- function(df){
+    df %>% rename_with(.cols = everything(), .fn = ~ gsub("get\\(var\\)", "", .x))
+}
+
+train_norm <- clean_column_names(train_norm)
+test_norm <- clean_column_names(test_norm)
+
+# Perform feature Scaling: mean normalization
+
+# function for scaling data with standardization on FULL training set
+standardize_full <- function(dataset, features) {
+  # Copy original dataset
+  scaled_dataset <- dataset
+  
+  # Loop through each feature given
+  for(feature in features) {
+    # Scale the feature using mean standarization
+    mean_value <- mean(train_norm[[feature]])
+    sd_value <- sd(train_norm[[feature]])
+    
+    # replace data with now scaled data
+    scaled_dataset[[feature]] <- (dataset[[feature]] - mean_value) / sd_value
+  }
+  
+  return(scaled_dataset)
+}
+
+# function for scaling data with standardization on FOLD ONLY
+standardize <- function(dataset, features) {
+  # Copy original dataset
+  scaled_dataset <- dataset
+  
+  # Loop through each feature given
+  for(feature in features) {
+    # Scale the feature using standarization
+    mean_value <- mean(dataset[[feature]])
+    sd_value <- sd(dataset[[feature]])
+    
+    # replace data with now scaled data
+    scaled_dataset[[feature]] <- (dataset[[feature]] - mean_value) / sd_value
+  }
+  
+  return(scaled_dataset)
+}
+
+
+# Create 5 folds on randomized training data
+rand <- train_norm[sample(nrow(train_norm)), ]
+folds <- createFolds(rand$popularity, k =5)
+
+# create list to store standardized datasets
+standardized_datasets <- list()
+
+for (i in 1:length(folds)) {
+  # Split the dataset into training and testing sets based on folds
+  test_indices <- folds[[i]]
+  train_indices <- setdiff(1:nrow(train_norm), test_indices)
+  
+  train_data <- rand[train_indices, ]
+  test_data <- rand[test_indices, ]
+
+  # Standardize each fold
+  standardized_train_data <- standardize(train_data, continuous)
+  standardized_test_data <- standardize(test_data, continuous)
+
+  # Store standardized data
+  standardized_datasets[[i]] <- list(train = standardized_train_data, test = standardized_test_data)
+}
+
+# create new train and test dataframes with standardization
+test_norm <- standardize_full(test_norm, continuous)
+train_norm <- standardize_full(train_norm, continuous)
+
+# define features
+exclude <- c("popularity", "id", "album_name", "track_name")
+features <- setdiff(names(test_norm), exclude)
+
+
+# data is now preprocessed and ready for analysis!
+```
+
+Exploring Data
+```{r}
+# plot popularity
+hist(train_norm$popularity, main="Histogram of Popularity", xlab = "Popularity")
+
+# determine proportion of songs with popularity == 0
+proportion = mean(train_norm$popularity == 0)
+proportion
+
+# print summary
+summary(train_norm$popularity)
+
+# plot boxplot
+boxplot(train_norm$popularity, main = "Popularity", horizontal = TRUE)
+```
+
+# Ridge Regression
+```{r}
+# for reproducibility
+set.seed(0)
+
+# load libraries
+library(glmnet)
+
+# define list for MSE of each fold
+MSE_Results <- list()
+
+for (i in 1:length(standardized_datasets)){
+  # store ith fold of training and testing data
+  train_data <- standardized_datasets[[i]]$train
+  test_data <- standardized_datasets[[i]]$test
+  
+  # convert to a matrix for ridge regression
+  X_train <- as.matrix(train_data[, features])
+  y_train <- train_data$popularity
+  
+  X_test <- as.matrix(test_data[, features])
+  y_test <- test_data$popularity
+  
+  # Pick optimal lambda with cross validation
+  cv_fit <- cv.glmnet(X_train, y_train, alpha = 0)
+  lambda_opt <- cv_fit$lambda.min
+  
+  # fit optimal model
+  ridge_model <- glmnet(X_train, y_train, alpha = 0, lambda = lambda_opt)
+  
+  # make prediction on testing set
+  predictions <- predict(ridge_model, s = lambda_opt, newx = X_test)
+  
+  # calculate MSE
+  MSE_Results[i] <- mean((predictions - y_test)^2)
+}
+
+# calculate average MSE of Ridge Regression
+RidgeRegressionMSE <- mean(unlist(MSE_Results))
+RidgeRegressionMSE
+```
+
+# Lasso Regression and Relaxed Lasso
+```{r}
+# for reproducibility
+set.seed(0)
+
+# load libraries
+library(glmnet)
+
+# define lists for MSE on each fold
+MSE_Results <- list()
+MSE_OLS <- list()
+
+for (i in 1:length(standardized_datasets)){
+  # store ith fold of training and testing data
+  train_data <- standardized_datasets[[i]]$train
+  test_data <- standardized_datasets[[i]]$test
+  
+  # convert to a matrix for Lasso regression
+  X_train <- as.matrix(train_data[, features])
+  y_train <- train_data$popularity
+  
+  X_test <- as.matrix(test_data[, features])
+  y_test <- test_data$popularity
+  
+  # Pick optimal lambda with cross validation
+  cv_fit <- cv.glmnet(X_train, y_train, alpha = 1)
+  lambda_opt <- cv_fit$lambda.min
+  
+  # fit optimal model
+  lasso_model <- glmnet(X_train, y_train, alpha = 1, lambda = lambda_opt)
+  
+  # make prediction on testing set
+  predictions <- predict(lasso_model, s = lambda_opt, newx = X_test)
+  
+  # calculate MSE
+  MSE_Results[i] <- mean((predictions - y_test)^2)
+  
+  # Relaxed Lasso
+  
+  # define a model using the shrunk lasso features
+  coef_lasso <- coef(cv_fit, s = lambda_opt, exact = TRUE)
+  coef_lasso_named <- as.numeric(coef_lasso[-1])
+  names(coef_lasso_named) <- rownames(coef_lasso)[-1]
+  selected_features <- names(coef_lasso_named)[coef_lasso_named != 0]
+  
+  # define X train/test for fold training/testing
+  X_train_selected <- X_train[, selected_features, drop = FALSE]
+  X_test_selected <- X_test[, selected_features, drop = FALSE]
+  
+  # fit model
+  OLS_model <- lm(y_train ~ ., data = as.data.frame(X_train_selected))
+  
+  # make predictions
+  OLS_pred <- predict(OLS_model, newdata = as.data.frame(X_test_selected))
+
+  # calculate MSE
+  MSE_OLS[i] <- mean((OLS_pred - y_test)^2)
+}
+
+# calculate average MSE of Lasso Regression
+LassoRegressionMSE <- mean(unlist(MSE_Results))
+LassoRegressionMSE
+
+# calculate average MSE of Relaxed Lasso Regression
+OLS_MSE <- mean(unlist(MSE_OLS))
+OLS_MSE
+```
+
+# Data is severely right skewed, because a large amount of data should be classified as 0. Test if KNN can provide a reasonable result
+
+```{r}
+set.seed(0)
+
+# load libraries
+library(class)
+library(ggplot2)
+
+# define list
+MSE_Results_KNN <- list()
+
+  for (i in 1:length(standardized_datasets)) {
+    # Store ith fold of training and testing data
+    train_data <- standardized_datasets[[i]]$train
+    test_data <- standardized_datasets[[i]]$test
+    
+    # Convert to a matrix for KNN
+    X_train <- as.matrix(train_data[, features])
+    y_train <- train_data$popularity
+    
+    X_test <- as.matrix(test_data[, features])
+    y_test <- test_data$popularity
+    
+    # Applying KNN
+    predictions <- knn(train = X_train, test = X_test, cl = y_train, k = 1)
+    
+    # convert predictions to numeric
+    predictions_numeric <- as.numeric(as.character(predictions))
+    
+    # Calculate MSE for the current fold
+    MSE_Results_KNN[i] <- mean((predictions_numeric - y_test)^2)
+  }
+  
+  # Calculate average MSE for current k across all folds
+  MSE_Results_KNN <- mean(unlist(MSE_Results_KNN))
+
+
+# print minimum MSE
+print(MSE_Results_KNN)
+```
+
+Ensemble Methods: Bagging
+```{r}
+set.seed(0)
+
+library(randomForest)
+library(ggplot2)
+
+MSE_Bagged <- list()
+
+for (i in 1:length(standardized_datasets)){
+  # Store ith fold of training and testing data
+  train_data <- standardized_datasets[[i]]$train
+  test_data <- standardized_datasets[[i]]$test
+  
+  # Prepare data as matrix form
+  X_train <- as.matrix(train_data[, features])
+  y_train <- train_data$popularity
+  
+  X_test <- as.matrix(test_data[, features])
+  y_test <- test_data$popularity
+  
+  # Fit bagged tree model using randomForest
+  bagged_model <- randomForest(X_train, y_train, ntree = 500, mtry = length(features))
+  
+  # Make predictions on the testing set
+  predictions <- predict(bagged_model, newdata = X_test)
+  
+  # Calculate MSE for the current fold
+  MSE_Bagged[i] <- mean((predictions - y_test)^2)
+}
+
+# Calculate average MSE of Bagged Tree Regression
+BaggedTreesMSE <- mean(unlist(MSE_Bagged))
+BaggedTreesMSE
+
+# Print important features
+importance(bagged_model)
+
+# Calculate feature importance
+importance_data <- importance(bagged_model)
+feature_names <- rownames(importance_data)
+importance_df <- data.frame(Feature = feature_names, Importance = importance_data[,1])
+
+# Use ggplot2 to create a bar plot of feature importance
+ggplot(importance_df, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(title = "Feature Importance in Bagged Model", x = "Feature", y = "Importance (IncNodePurity)") +
+  coord_flip()
+
+
+```
+
+Boosting
+```{r}
+set.seed(0)
+
+library(gbm)
+
+# Initialize list to store MSE for each fold
+MSE_boost <- list()
+
+for (i in 1:length(standardized_datasets)) {
+  # Store ith fold of training and testing data
+  train_data <- standardized_datasets[[i]]$train
+  test_data <- standardized_datasets[[i]]$test
+  
+  # Prepare features and target variable
+  X_train <- train_data[, features]
+  y_train <- train_data$popularity
+  
+  X_test <- test_data[, features]
+  y_test <- test_data$popularity
+  
+  # Fit boosting model
+  boosting_model <- gbm(popularity ~ duration_ms + explicit + danceability + energy + loudness + mode +
+    speechiness + acousticness + instrumentalness + liveness + valence + tempo +
+    key_10 + key_0 + key_6 + key_2 + key_7 +
+    key_1 + key_9 + key_5 + key_3 + key_11 +
+    key_8 + time_signature_3 + time_signature_5 + 
+    time_signature_1 + track_genre_rock + track_genre_jazz, data = train_data, distribution = "gaussian", n.trees = 500, interaction.depth = 4, shrinkage = 0.01, cv.folds = 5)
+  
+  # Summarize the fit
+  summary(boosting_model)
+  
+  # Make predictions on the testing set
+  predictions <- predict(boosting_model, newdata = X_test, n.trees = 500)
+  
+  # Calculate MSE for the current fold
+  MSE_boost[i] <- mean((predictions - y_test)^2)
+}
+
+# Calculate average MSE of boosted model
+avg_boost_mse <- mean(unlist(MSE_boost))
+avg_boost_mse
+
+```
+
+Random Forests
+```{r}
+library(randomForest)
+
+set.seed(0)
+
+# Initialize lists to store MSE for each fold
+MSE_RandomForest <- list()
+
+for (i in 1:length(standardized_datasets)){
+  # Store ith fold of training and testing data
+  train_data <- standardized_datasets[[i]]$train
+  test_data <- standardized_datasets[[i]]$test
+  
+  # Convert to a matrix
+  X_train <- as.matrix(train_data[, features])
+  y_train <- train_data$popularity
+  
+  X_test <- as.matrix(test_data[, features])
+  y_test <- test_data$popularity
+  
+  # Fit Random Forest model
+  rf_model <- randomForest(X_train, y_train, ntree = 500, mtry = length(features)/3, importance = TRUE)
+  
+  # Make predictions on the testing set
+  predictions <- predict(rf_model, newdata = X_test)
+  
+  # Calculate MSE for the current fold
+  MSE_RandomForest[i] <- mean((predictions - y_test)^2)
+}
+
+# Calculate average MSE
+RandomForestMSE <- mean(unlist(MSE_RandomForest))
+RandomForestMSE
+
+
+# Print important features
+importance(rf_model)
+```
+Neural Network
+```{r}
+library(nnet)
+
+set.seed(0)
+
+# list to store MSE for each fold
+MSE_NN <- list()
+
+for (i in 1:length(standardized_datasets)){
+  
+  # Store ith fold of training and testing data
+  train_data <- standardized_datasets[[i]]$train
+  test_data <- standardized_datasets[[i]]$test
+  
+  # Prepare features and response as data frames
+  X_train <- as.data.frame(train_data[, features])
+  y_train <- train_data$popularity
+  
+  X_test <- as.data.frame(test_data[, features])
+  y_test <- test_data$popularity
+  
+  # Fit Neural Network model for regression, size of 4 with decay = 0.05 yields best results
+  nn_model <- nnet(train_data$popularity ~ ., data = X_train, size = 4, linout = TRUE, decay = 0.05, maxit = 5000)
+  
+  # Make predictions on the testing set
+  predictions <- predict(nn_model, newdata = X_test, type = "raw")
+  
+  # Calculate MSE for the current fold
+  MSE_NN[i] <- mean((predictions - y_test)^2)
+}
+
+# Calculate average MSE of Neural Network Regression
+NN_MSE <- mean(unlist(MSE_NN))
+NN_MSE
+
+
+```
+
+# create the final model (bagging trees)
+```{r}
+# for replicability
+set.seed(0)
+
+# include library
+library(randomForest)
+
+# define training data
+X_train <- as.matrix(train_norm[, features])
+y_train <- train_norm$popularity
+
+# fit bagged model
+bagged_model <- randomForest(X_train, y_train, ntree = 500, mtry = length(features))
+
+# Make predictions on the testing set
+test_norm$popularity <- predict(bagged_model, newdata = test_norm)
+
+# select id and popularity
+select <- test_norm[, c("id", "popularity")]
+
+# write to csv
+write.csv(select, "testing_predictions_Ginck_Nathaniel_NEG53.csv", row.names = FALSE)
+
+
+```
